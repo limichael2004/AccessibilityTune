@@ -1,0 +1,1725 @@
+import cv2
+import dlib
+import numpy as np
+import time
+import math
+import subprocess
+import os
+import json
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+# --- Configuration & Default Settings ---
+class AppConfig:
+    def __init__(self):
+        # Gesture Mappings (action name -> function name)
+        self.gesture_actions = {
+            "look_right": "volume_up",
+            "look_left": "pause_music",
+            "long_blink": "next_song",
+            "look_up": None,
+            "look_down": None,
+            "smile": None,
+            "open_mouth": None,
+            "raise_eyebrows": None,
+            "right_wink": None,
+            "left_wink": None
+        }
+        
+        # Threshold Settings
+        self.thresholds = {
+            "YAW_THRESHOLD_RIGHT": -45,    # Degrees head needs to turn right
+            "YAW_THRESHOLD_LEFT": 45,      # Degrees head needs to turn left
+            "PITCH_THRESHOLD_UP": -25,     # Degrees head needs to tilt up
+            "PITCH_THRESHOLD_DOWN": 25,    # Degrees head needs to tilt down
+            "LONG_BLINK_DURATION": 5.0,    # Seconds eyes must be closed
+            "RIGHT_WINK_DURATION": 2.0,    # Seconds right eye must be closed
+            "LEFT_WINK_DURATION": 2.0,     # Seconds left eye must be closed
+            "SMILE_DURATION": 2.0,         # Seconds smile must be held
+            "OPEN_MOUTH_DURATION": 2.0,    # Seconds mouth must be open
+            "RAISED_EYEBROWS_DURATION": 2.0, # Seconds eyebrows must be raised
+            "ACTION_COOLDOWN": 1.0,        # Cooldown between actions
+            "CONTINUOUS_ACTION_INTERVAL": 2.5,  # Time between continuous actions
+            "EYE_AR_THRESH": 0.2,          # Eye aspect ratio for blink
+            "MOUTH_AR_THRESH": 0.5,        # Mouth aspect ratio for opening
+            "SMILE_THRESHOLD": 0.7         # Threshold for smile detection
+        }
+        
+        # Advanced gesture combinations
+        self.gesture_combinations = [
+            {
+                "first_gesture": "smile", 
+                "duration": 3.0, 
+                "second_gesture": "look_right",
+                "action": "volume_up"
+            },
+            {
+                "first_gesture": "open_mouth",
+                "duration": 2.0,
+                "second_gesture": "look_left",
+                "action": "prev_song"
+            }
+        ]
+        
+        # Available Actions (for UI mapping)
+        self.available_actions = [
+            "volume_up",
+            "volume_down",
+            "pause_music",
+            "next_song",
+            "prev_song",
+            "none"  # Option for no action
+        ]
+        
+        # Config file path
+        self.config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music_control_config.json")
+    
+    def save_config(self):
+        """Save current configuration to file"""
+        config_data = {
+            "gesture_actions": self.gesture_actions,
+            "thresholds": self.thresholds,
+            "gesture_combinations": self.gesture_combinations
+        }
+        
+        try:
+            with open(self.config_path, 'w') as f:
+                json.dump(config_data, f, indent=4)
+            return True
+        except Exception as e:
+            print(f"Error saving configuration: {e}")
+            return False
+    
+    def load_config(self):
+        """Load configuration from file if exists"""
+        if not os.path.exists(self.config_path):
+            print("No saved configuration found. Using defaults.")
+            return False
+        
+        try:
+            with open(self.config_path, 'r') as f:
+                config_data = json.load(f)
+                
+            # Update settings from file
+            self.gesture_actions.update(config_data.get("gesture_actions", {}))
+            self.thresholds.update(config_data.get("thresholds", {}))
+            
+            # Load gesture combinations if present
+            if "gesture_combinations" in config_data:
+                self.gesture_combinations = config_data["gesture_combinations"]
+                
+            return True
+        except Exception as e:
+            print(f"Error loading configuration: {e}")
+            return False
+
+# --- Global Configuration ---
+config = AppConfig()
+
+# --- Music Control Functions (macOS AppleScript Version) ---
+def run_applescript(script_command):
+    """Helper function to run AppleScript and handle errors."""
+    try:
+        subprocess.run(['osascript', '-e', script_command], check=True, capture_output=True)
+        return True
+    except FileNotFoundError:
+        print("  Error: 'osascript' command not found. Is this running on macOS?")
+        return False
+    except subprocess.CalledProcessError as e:
+        # Common error if Spotify is not running or doesn't respond
+        error_message = e.stderr.decode().strip() if e.stderr else "Unknown AppleScript error"
+        # Filter common "not running" errors to avoid spamming console
+        if "Application isn't running" not in error_message and "(-600)" not in error_message:
+             print(f"  AppleScript Error: {error_message}")
+        # Silently fail if Spotify isn't running, otherwise print error
+        return False
+    except Exception as e:
+        print(f"  Unexpected error running AppleScript: {e}")
+        return False
+
+def pause_music():
+    print("ACTION: Pause/Play Music (AppleScript)")
+    # Tells Spotify specifically to toggle play/pause
+    run_applescript('tell application "Spotify" to playpause')
+
+def next_song():
+    print("ACTION: Next Song (AppleScript)")
+    # Tells Spotify specifically to go to the next track
+    run_applescript('tell application "Spotify" to next track')
+
+def prev_song():
+    print("ACTION: Previous Song (AppleScript)")
+    # Tells Spotify specifically to go to the previous track
+    run_applescript('tell application "Spotify" to previous track')
+
+def volume_up():
+    print("ACTION: Volume Up (System AppleScript)")
+    # Adjusts SYSTEM volume up by a step (e.g., 3 out of 100). Reduced for continuous control
+    run_applescript('set volume output volume (output volume of (get volume settings) + 3)')
+
+def volume_down():
+    print("ACTION: Volume Down (System AppleScript)")
+    # Adjusts SYSTEM volume down by a step (e.g., 3 out of 100). Reduced for continuous control
+    run_applescript('set volume output volume (output volume of (get volume settings) - 3)')
+
+# Dictionary of available actions for mapping
+action_functions = {
+    "pause_music": pause_music,
+    "next_song": next_song,
+    "prev_song": prev_song,
+    "volume_up": volume_up,
+    "volume_down": volume_down,
+    "none": lambda: None  # No-op function for "none" action
+}
+
+# --- Configuration UI ---
+class ConfigurationUI:
+    def __init__(self, master, app_config):
+        self.master = master
+        self.config = app_config
+        self.master.title("Music Control Configuration")
+        self.master.geometry("800x700")  # Increased size for better spacing
+        self.master.resizable(True, True)  # Allow resizing
+        
+        # Load any saved config first
+        self.config.load_config()
+        
+        # Create UI
+        self.create_widgets()
+    
+    def create_widgets(self):
+        """Create all UI elements with improved aesthetics"""
+        # Main frame with padding
+        main_frame = ttk.Frame(self.master, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Custom style for better aesthetics
+        style = ttk.Style()
+        style.configure("TLabel", font=("Arial", 11))
+        style.configure("TButton", font=("Arial", 11))
+        style.configure("TNotebook.Tab", font=("Arial", 11), padding=[10, 5])
+        style.configure("Title.TLabel", font=("Arial", 18, "bold"))
+        style.configure("Header.TLabel", font=("Arial", 13, "bold"))
+        
+        # Title
+        title_label = ttk.Label(main_frame, text="Head Gesture Music Control Configuration by Michael Li", 
+                               style="Title.TLabel")
+        title_label.pack(pady=(0, 25))
+        
+        # Create notebooks for tabs
+        notebook = ttk.Notebook(main_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # === Gesture Mappings Tab ===
+        mappings_frame = ttk.Frame(notebook, padding=15)
+        notebook.add(mappings_frame, text="Gesture Mappings")
+        
+        # Gesture mapping section
+        ttk.Label(mappings_frame, text="Assign Actions to Gestures:", 
+                 style="Header.TLabel").pack(anchor=tk.W, pady=(0, 15))
+        
+        # Create dropdown for each gesture mapping
+        self.gesture_vars = {}
+        
+        # Define the gestures and their friendly display names
+        gesture_display = {
+            "look_right": "Look Right",
+            "look_left": "Look Left",
+            "long_blink": "Long Blink (eyes closed)",
+            "right_wink": "Right Eye Wink",
+            "left_wink": "Left Eye Wink",
+            "look_up": "Look Up",
+            "look_down": "Look Down",
+            "smile": "Smile",
+            "open_mouth": "Open Mouth",
+            "raise_eyebrows": "Raise Eyebrows"
+        }
+        
+        # Create a frame for the gesture mappings with better spacing
+        mapping_frame = ttk.Frame(mappings_frame)
+        mapping_frame.pack(fill=tk.X, pady=10)
+        
+        # Create two columns of gesture mappings with equal width
+        left_frame = ttk.Frame(mapping_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        
+        right_frame = ttk.Frame(mapping_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
+        
+        # Action list with friendly names for UI
+        action_display = {
+            "volume_up": "Volume Up",
+            "volume_down": "Volume Down",
+            "pause_music": "Pause/Play Music",
+            "next_song": "Next Song",
+            "prev_song": "Previous Song",
+            "none": "No Action"
+        }
+        
+        # Split gestures between columns
+        gestures = list(gesture_display.items())
+        mid_point = len(gestures) // 2
+        
+        # Create left column with better spacing
+        for i, (gesture_key, gesture_name) in enumerate(gestures[:mid_point]):
+            frame = ttk.Frame(left_frame)
+            frame.pack(fill=tk.X, pady=8)
+            
+            # Fixed width label for better alignment
+            gesture_label = ttk.Label(frame, text=f"{gesture_name}:", width=20)
+            gesture_label.pack(side=tk.LEFT, padx=(0, 10))
+            
+            # Get action or default to "none" if None is set or action not found
+            current_action = self.config.gesture_actions.get(gesture_key)
+            if current_action is None or current_action not in self.config.available_actions:
+                current_action = "none"
+                
+            action_var = tk.StringVar(value=current_action)
+            self.gesture_vars[gesture_key] = action_var
+            
+            # Create dropdown with friendly names and fixed width
+            dropdown = ttk.Combobox(frame, textvariable=action_var, state="readonly", width=15)
+            dropdown['values'] = [action_display[a] for a in self.config.available_actions]
+            dropdown.current(self.config.available_actions.index(current_action))
+            dropdown.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+            
+            # Bind change event to update config
+            # Bind change event to update config
+            def make_callback(g_key, a_var):
+                def callback(event):
+                    # Convert display name back to function name
+                    display_to_func = {v: k for k, v in action_display.items()}
+                    selected_value = a_var.get()
+                    if selected_value in display_to_func:
+                        function_name = display_to_func[selected_value]
+                        self.config.gesture_actions[g_key] = function_name if function_name != "none" else None
+                        # Debug print to verify the update
+                        # print(f"Updated {g_key} to {function_name}")
+                return callback
+                    
+            dropdown.bind("<<ComboboxSelected>>", make_callback(gesture_key, action_var))
+        
+        # Create right column with better spacing
+        for i, (gesture_key, gesture_name) in enumerate(gestures[mid_point:]):
+            frame = ttk.Frame(right_frame)
+            frame.pack(fill=tk.X, pady=8)
+            
+            # Fixed width label for better alignment
+            gesture_label = ttk.Label(frame, text=f"{gesture_name}:", width=20)
+            gesture_label.pack(side=tk.LEFT, padx=(0, 10))
+            
+            # Get action or default to "none" if None is set or action not found
+            current_action = self.config.gesture_actions.get(gesture_key)
+            if current_action is None or current_action not in self.config.available_actions:
+                current_action = "none"
+                
+            action_var = tk.StringVar(value=current_action)
+            self.gesture_vars[gesture_key] = action_var
+            
+            # Create dropdown with friendly names and fixed width
+            dropdown = ttk.Combobox(frame, textvariable=action_var, state="readonly", width=15)
+            dropdown['values'] = [action_display[a] for a in self.config.available_actions]
+            dropdown.current(self.config.available_actions.index(current_action))
+            dropdown.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+            
+            # Bind change event
+            dropdown.bind("<<ComboboxSelected>>", make_callback(gesture_key, action_var))
+
+        # === Combination Gestures Section ===
+        ttk.Separator(mappings_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=20)
+        
+        ttk.Label(mappings_frame, text="Advanced Gesture Combinations:", 
+                 style="Header.TLabel").pack(anchor=tk.W, pady=(10, 15))
+        
+        # Create a frame for combination mappings
+        combo_frame = ttk.Frame(mappings_frame)
+        combo_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Create a scrollable frame for combinations
+        combo_canvas = tk.Canvas(combo_frame)
+        combo_scrollbar = ttk.Scrollbar(combo_frame, orient="vertical", command=combo_canvas.yview)
+        scrollable_combo = ttk.Frame(combo_canvas)
+        
+        scrollable_combo.bind(
+            "<Configure>",
+            lambda e: combo_canvas.configure(scrollregion=combo_canvas.bbox("all"))
+        )
+        
+        combo_canvas.create_window((0, 0), window=scrollable_combo, anchor="nw")
+        combo_canvas.configure(yscrollcommand=combo_scrollbar.set)
+        
+        combo_canvas.pack(side="left", fill="both", expand=True)
+        combo_scrollbar.pack(side="right", fill="y")
+        
+        # Add combination rows (with ability to add more)
+        self.combo_rows = []
+        
+        # Add a row function
+        def add_combo_row(first_gesture="", duration=3.0, second_gesture="", action=""):
+            row_frame = ttk.Frame(scrollable_combo)
+            row_frame.pack(fill=tk.X, pady=5)
+            
+            # First gesture dropdown
+            first_gesture_cb = ttk.Combobox(row_frame, values=list(gesture_display.values()), width=15)
+            if first_gesture:
+                first_gesture_display = gesture_display.get(first_gesture, "")
+                if first_gesture_display in list(gesture_display.values()):
+                    first_gesture_cb.set(first_gesture_display)
+                else:
+                    first_gesture_cb.current(0)
+            else:
+                first_gesture_cb.current(0)
+            first_gesture_cb.pack(side=tk.LEFT, padx=5)
+            
+            # Duration entry
+            ttk.Label(row_frame, text="for").pack(side=tk.LEFT, padx=2)
+            duration_sb = ttk.Spinbox(row_frame, from_=0.5, to=10.0, increment=0.5, width=5)
+            duration_sb.set(str(duration))
+            duration_sb.pack(side=tk.LEFT, padx=2)
+            ttk.Label(row_frame, text="sec, then").pack(side=tk.LEFT, padx=2)
+            
+            # Second gesture dropdown
+            second_gesture_cb = ttk.Combobox(row_frame, values=list(gesture_display.values()), width=15)
+            if second_gesture:
+                second_gesture_display = gesture_display.get(second_gesture, "")
+                if second_gesture_display in list(gesture_display.values()):
+                    second_gesture_cb.set(second_gesture_display)
+                else:
+                    second_gesture_cb.current(0)
+            else:
+                second_gesture_cb.current(0)
+            second_gesture_cb.pack(side=tk.LEFT, padx=5)
+            
+            # Action dropdown
+            ttk.Label(row_frame, text="=").pack(side=tk.LEFT, padx=5)
+            action_cb = ttk.Combobox(row_frame, values=[action_display[a] for a in self.config.available_actions], width=15)
+            if action:
+                action_display_value = action_display.get(action, "")
+                if action_display_value in [action_display[a] for a in self.config.available_actions]:
+                    action_cb.set(action_display_value)
+                else:
+                    action_cb.current(0)
+            else:
+                action_cb.current(0)
+            action_cb.pack(side=tk.LEFT, padx=5)
+            
+            # Delete button
+            delete_btn = ttk.Button(row_frame, text="X", width=2, 
+                                  command=lambda: row_frame.destroy())
+            delete_btn.pack(side=tk.RIGHT, padx=5)
+            
+            # Save row reference
+            self.combo_rows.append({
+                "frame": row_frame,
+                "first_gesture": first_gesture_cb,
+                "duration": duration_sb,
+                "second_gesture": second_gesture_cb,
+                "action": action_cb
+            })
+        
+        # Add initial rows from loaded configurations
+        if hasattr(self.config, 'gesture_combinations') and self.config.gesture_combinations:
+            for combo in self.config.gesture_combinations:
+                add_combo_row(
+                    combo.get("first_gesture", ""),
+                    combo.get("duration", 3.0),
+                    combo.get("second_gesture", ""),
+                    combo.get("action", "")
+                )
+        else:
+            # Add default rows if no configurations
+            add_combo_row()
+            add_combo_row()
+        
+        # Add button for new combinations
+        add_btn = ttk.Button(scrollable_combo, text="+ Add Combination", 
+                           command=lambda: add_combo_row())
+        add_btn.pack(anchor=tk.W, pady=10)
+
+        # === Thresholds Tab with improved layout ===
+        thresholds_frame = ttk.Frame(notebook, padding=15)
+        notebook.add(thresholds_frame, text="Sensitivity Settings")
+        
+        ttk.Label(thresholds_frame, text="Adjust Gesture Detection Sensitivity:", 
+                 style="Header.TLabel").pack(anchor=tk.W, pady=(0, 15))
+        
+        # Create sliders for each threshold
+        self.threshold_vars = {}
+        
+        # Define thresholds and their display properties with improved descriptions
+        threshold_display = {
+            "YAW_THRESHOLD_RIGHT": {
+                "name": "Head Turn Right Sensitivity",
+                "desc": "How far you need to turn your head right (negative degrees)",
+                "min": -90, "max": -15, "resolution": 1
+            },
+            "YAW_THRESHOLD_LEFT": {
+                "name": "Head Turn Left Sensitivity",
+                "desc": "How far you need to turn your head left (positive degrees)",
+                "min": 15, "max": 90, "resolution": 1
+            },
+            "PITCH_THRESHOLD_UP": {
+                "name": "Head Tilt Up Sensitivity",
+                "desc": "How far you need to tilt your head up (negative degrees)",
+                "min": -45, "max": -5, "resolution": 1
+            },
+            "PITCH_THRESHOLD_DOWN": {
+                "name": "Head Tilt Down Sensitivity",
+                "desc": "How far you need to tilt your head down (positive degrees)",
+                "min": 5, "max": 45, "resolution": 1
+            },
+            "LONG_BLINK_DURATION": {
+                "name": "Long Blink Duration",
+                "desc": "How long to keep eyes closed to trigger action (seconds)",
+                "min": 0.5, "max": 10, "resolution": 0.5
+            },
+            "RIGHT_WINK_DURATION": {
+                "name": "Right Wink Duration",
+                "desc": "How long to keep right eye closed (seconds)",
+                "min": 0.5, "max": 5, "resolution": 0.5
+            },
+            "LEFT_WINK_DURATION": {
+                "name": "Left Wink Duration",
+                "desc": "How long to keep left eye closed (seconds)",
+                "min": 0.5, "max": 5, "resolution": 0.5
+            },
+            "SMILE_DURATION": {
+                "name": "Smile Duration",
+                "desc": "How long to hold smile to trigger action (seconds)",
+                "min": 0.5, "max": 5, "resolution": 0.5
+            },
+            "OPEN_MOUTH_DURATION": {
+                "name": "Open Mouth Duration",
+                "desc": "How long to keep mouth open (seconds)",
+                "min": 0.5, "max": 5, "resolution": 0.5
+            },
+            "RAISED_EYEBROWS_DURATION": {
+                "name": "Raised Eyebrows Duration", 
+                "desc": "How long to keep eyebrows raised (seconds)",
+                "min": 0.5, "max": 5, "resolution": 0.5
+            },
+            "ACTION_COOLDOWN": {
+                "name": "Action Cooldown",
+                "desc": "Minimum time between triggered actions (seconds)",
+                "min": 0.1, "max": 5, "resolution": 0.1
+            },
+            "CONTINUOUS_ACTION_INTERVAL": {
+                "name": "Continuous Action Interval",
+                "desc": "Time between repeated continuous actions (seconds)",
+                "min": 0.1, "max": 5, "resolution": 0.1
+            },
+            "EYE_AR_THRESH": {
+                "name": "Eye Blink Sensitivity",
+                "desc": "Lower values = more sensitive to blinks",
+                "min": 0.1, "max": 0.5, "resolution": 0.01
+            },
+            "MOUTH_AR_THRESH": {
+                "name": "Mouth Opening Sensitivity",
+                "desc": "Higher values = more sensitive to mouth opening",
+                "min": 0.3, "max": 0.8, "resolution": 0.01
+            },
+            "SMILE_THRESHOLD": {
+                "name": "Smile Detection Sensitivity",
+                "desc": "Higher values = more sensitive to smile detection",
+                "min": 0.3, "max": 1.0, "resolution": 0.01
+            }
+        }
+        
+        # Create a canvas with scrollbar for many sliders
+        canvas = tk.Canvas(thresholds_frame)
+        scrollbar = ttk.Scrollbar(thresholds_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Create sliders for each threshold with improved styling
+        for key, props in threshold_display.items():
+            # Skip if threshold doesn't exist in config
+            if key not in self.config.thresholds and key != "RAISED_EYEBROWS_DURATION":
+                continue
+                
+            # Create a group frame with border
+            group_frame = ttk.LabelFrame(scrollable_frame, text=props["name"], padding=(10, 5))
+            group_frame.pack(fill=tk.X, pady=8, padx=5)
+            
+            # Description
+            # Description
+            ttk.Label(group_frame, text=props["desc"], wraplength=500).pack(anchor=tk.W, pady=(0, 5))
+            
+            # Create variable bound to slider
+            default_value = self.config.thresholds.get(key, (props["min"] + props["max"]) / 2)
+            var = tk.DoubleVar(value=default_value)
+            self.threshold_vars[key] = var
+            
+            # Create a frame for slider and value label
+            slider_frame = ttk.Frame(group_frame)
+            slider_frame.pack(fill=tk.X, pady=(0, 5))
+            
+            # Min label
+            min_label = ttk.Label(slider_frame, text=str(props["min"]))
+            min_label.pack(side=tk.LEFT, padx=(0, 5))
+            
+            # Create slider with improved appearance
+            slider = ttk.Scale(
+                slider_frame, from_=props["min"], to=props["max"],
+                orient="horizontal", variable=var
+            )
+            slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+            
+            # Max label
+            max_label = ttk.Label(slider_frame, text=str(props["max"]))
+            max_label.pack(side=tk.LEFT, padx=(5, 10))
+            
+            # Value display label
+            value_label = ttk.Label(slider_frame, text=str(var.get()), width=5)
+            value_label.pack(side=tk.RIGHT, padx=5)
+            
+            # Update handler for sliders with negative ranges
+           # Fix for update handlers - use a single approach for all sliders
+            def make_update_function(k=key, v=var, label=value_label):
+                def update_function(_):
+                    value = round(float(v.get()), 2)
+                    self.config.thresholds[k] = value
+                    label.config(text=f"{value:.1f}")
+                return update_function
+            
+            # Attach the update function to the slider
+            slider.config(command=make_update_function())
+                
+        # === Instructions Tab with better formatting ===
+        help_frame = ttk.Frame(notebook, padding=15)
+        notebook.add(help_frame, text="Instructions")
+        
+        instructions = """
+Head Gesture Music Control - Instructions
+
+My name is Michael Li and I am a current Junior at the University of Notre Dame.
+
+I taught myself how to code about a year ago and I wanted to build this tool to help those who perhaps have physical limitations, giving them autonomy is controlling their music with facial landmark feature detection.
+
+This application lets you control Spotify music playback with head gestures and facial expressions.
+
+Right now it is configured only for AppleScript (Macbook) and Spotify, but I am working to make it compatible with AppleMusic and non-Macbook's as well
+
+
+
+Getting Started:
+1. Configure your preferred gestures and sensitivity settings
+2. Create advanced gesture combinations for specialized actions
+3. Click "Save & Start" to begin
+4. Ensure Spotify is running before starting
+
+During Operation:
+- The app will track your face and detect gestures
+- A status bar will show active gestures and progress
+- Press 'q' to quit at any time
+
+Customization Tips:
+- If gestures trigger too easily, adjust thresholds to be more extreme 
+  (larger head angles, longer durations)
+- If gestures are hard to trigger, adjust thresholds to be less extreme
+- Duration times can be shorter or longer based on your preferences
+- Use advanced combinations for more complex controls
+
+Available Gestures:
+- Look Right/Left: Turn head left or right
+- Look Up/Down: Tilt head up or down
+- Long Blink: Close both eyes for a set duration
+- Right/Left Wink: Close one eye for a set duration
+- Smile: Lift the corners of your mouth
+- Open Mouth: Open your mouth wide
+- Raise Eyebrows: Lift your eyebrows
+
+Keyboard Controls During Operation:
+- 'p': Print current settings to console
+- 'q': Quit application
+
+Note: This application requires a webcam and good lighting for optimal performance.
+        """
+        
+        # Create a text widget with scrollbar and improved styling
+        text_frame = ttk.Frame(help_frame)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+        
+        scrollbar = ttk.Scrollbar(text_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        help_text = tk.Text(text_frame, wrap=tk.WORD, yscrollcommand=scrollbar.set, 
+                           font=("Arial", 11), padx=10, pady=10)
+        help_text.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=help_text.yview)
+        
+        # Insert instructions with better formatting
+        help_text.insert(tk.END, instructions)
+        help_text.config(state=tk.DISABLED)  # Make read-only
+        
+        # === Buttons at bottom with improved styling ===
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill=tk.X, pady=15)
+        
+        # Reset button
+        reset_btn = ttk.Button(button_frame, text="Reset to Defaults", 
+                              command=self.reset_to_defaults, width=20)
+        reset_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Save button
+        save_btn = ttk.Button(button_frame, text="Save Configuration", 
+                             command=self.save_configuration, width=20)
+        save_btn.pack(side=tk.LEFT, padx=20)
+        
+        # Save and start button with emphasis
+        style.configure("Accent.TButton", font=("Arial", 11, "bold"))
+        start_btn = ttk.Button(button_frame, text="Save & Start", style="Accent.TButton",
+                              command=self.save_and_start, width=20)
+        start_btn.pack(side=tk.RIGHT, padx=5)
+    
+    def update_threshold(self, key, var):
+        """Update threshold value in config"""
+        value = round(float(var.get()), 2)
+        self.config.thresholds[key] = value
+    
+    def reset_to_defaults(self):
+        """Reset all settings to defaults"""
+        # Create a new config with defaults
+        default_config = AppConfig()
+        
+        # Update UI and current config
+        for key, var in self.threshold_vars.items():
+            if key in default_config.thresholds:
+                var.set(default_config.thresholds[key])
+                self.config.thresholds[key] = default_config.thresholds[key]
+        
+        # Update dropdowns
+        action_display = {
+            "volume_up": "Volume Up",
+            "volume_down": "Volume Down",
+            "pause_music": "Pause/Play Music",
+            "next_song": "Next Song",
+            "prev_song": "Previous Song",
+            "none": "No Action"
+        }
+        
+        for gesture, action in default_config.gesture_actions.items():
+            if gesture in self.gesture_vars:
+                display_action = action_display.get(action, "No Action")
+                self.gesture_vars[gesture].set(display_action)
+                self.config.gesture_actions[gesture] = action
+        
+        # Clear and reset combination rows
+        for row in self.combo_rows:
+            row["frame"].destroy()
+        
+        self.combo_rows = []
+        
+        # Add default combinations
+        for combo in default_config.gesture_combinations:
+            self.add_combo_row(
+                combo.get("first_gesture", ""),
+                combo.get("duration", 3.0),
+                combo.get("second_gesture", ""),
+                combo.get("action", "")
+            )
+        
+        messagebox.showinfo("Reset Complete", "All settings have been reset to defaults.")
+    
+    def save_configuration(self):
+        """Save current configuration to file"""
+        # Save gesture combinations from UI
+        self.config.gesture_combinations = []
+        
+        # Define display dictionaries for converting back
+        gesture_display = {
+            "look_right": "Look Right",
+            "look_left": "Look Left",
+            "long_blink": "Long Blink (eyes closed)",
+            "right_wink": "Right Eye Wink",
+            "left_wink": "Left Eye Wink",
+            "look_up": "Look Up",
+            "look_down": "Look Down",
+            "smile": "Smile",
+            "open_mouth": "Open Mouth",
+            "raise_eyebrows": "Raise Eyebrows"
+        }
+        
+        action_display = {
+            "volume_up": "Volume Up",
+            "volume_down": "Volume Down",
+            "pause_music": "Pause/Play Music",
+            "next_song": "Next Song",
+            "prev_song": "Previous Song",
+            "none": "No Action"
+        }
+        
+        display_to_gesture = {v: k for k, v in gesture_display.items()}
+        display_to_action = {v: k for k, v in action_display.items()}
+        
+        for row in self.combo_rows:
+            # Skip incomplete rows
+            if not row["first_gesture"].get() or not row["second_gesture"].get() or not row["action"].get():
+                continue
+                
+            first_gesture_name = display_to_gesture.get(row["first_gesture"].get())
+            second_gesture_name = display_to_gesture.get(row["second_gesture"].get())
+            action_name = display_to_action.get(row["action"].get())
+            
+            try:
+                duration = float(row["duration"].get())
+            except ValueError:
+                duration = 3.0
+                
+            if first_gesture_name and second_gesture_name and action_name:
+                self.config.gesture_combinations.append({
+                    "first_gesture": first_gesture_name,
+                    "duration": duration,
+                    "second_gesture": second_gesture_name,
+                    "action": action_name
+                })
+        
+        if self.config.save_config():
+            messagebox.showinfo("Success", "Configuration saved successfully.")
+        else:
+            messagebox.showerror("Error", "Failed to save configuration.")
+    
+    def save_and_start(self):
+        """Save configuration and start the main application"""
+        # Save current configuration
+        self.save_configuration()
+        
+        # Close the configuration window
+        self.master.destroy()
+        
+        # Indicate that we should start the main app
+        self.start_app = True
+    
+    def add_combo_row(self, first_gesture="", duration=3.0, second_gesture="", action=""):
+        """Add a new combination row to the UI"""
+        # Get the scrollable frame from existing UI
+        scrollable_combo = None
+        for child in self.master.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for c in child.winfo_children():
+                    if isinstance(c, ttk.Notebook):
+                        for tab in c.tabs():
+                            tab_widget = c.nametowidget(tab)
+                            if "Gesture Mappings" in c.tab(tab, "text"):
+                                for frame in tab_widget.winfo_children():
+                                    if isinstance(frame, ttk.Frame) and frame.winfo_children():
+                                        for subframe in frame.winfo_children():
+                                            if isinstance(subframe, ttk.Frame) and len(subframe.winfo_children()) > 1:
+                                                for canvas_frame in subframe.winfo_children():
+                                                    if isinstance(canvas_frame, tk.Canvas):
+                                                        scrollable_combo = canvas_frame.winfo_children()[0]
+                                                        break
+        
+        if not scrollable_combo:
+            return
+        
+        # Define display maps
+        gesture_display = {
+            "look_right": "Look Right",
+            "look_left": "Look Left", 
+            "long_blink": "Long Blink (eyes closed)",
+            "right_wink": "Right Eye Wink",
+            "left_wink": "Left Eye Wink",
+            "look_up": "Look Up",
+            "look_down": "Look Down",
+            "smile": "Smile",
+            "open_mouth": "Open Mouth",
+            "raise_eyebrows": "Raise Eyebrows"
+        }
+        
+        action_display = {
+            "volume_up": "Volume Up",
+            "volume_down": "Volume Down",
+            "pause_music": "Pause/Play Music",
+            "next_song": "Next Song",
+            "prev_song": "Previous Song",
+            "none": "No Action"
+        }
+        
+        row_frame = ttk.Frame(scrollable_combo)
+        row_frame.pack(fill=tk.X, pady=5)
+        
+        # First gesture dropdown
+        first_gesture_cb = ttk.Combobox(row_frame, values=list(gesture_display.values()), width=15)
+        if first_gesture:
+            first_gesture_display = gesture_display.get(first_gesture, "")
+            if first_gesture_display in list(gesture_display.values()):
+                first_gesture_cb.set(first_gesture_display)
+            else:
+                first_gesture_cb.current(0)
+        else:
+            first_gesture_cb.current(0)
+        first_gesture_cb.pack(side=tk.LEFT, padx=5)
+        
+        # Duration entry
+        ttk.Label(row_frame, text="for").pack(side=tk.LEFT, padx=2)
+        duration_sb = ttk.Spinbox(row_frame, from_=0.5, to=10.0, increment=0.5, width=5)
+        duration_sb.set(str(duration))
+        duration_sb.pack(side=tk.LEFT, padx=2)
+        ttk.Label(row_frame, text="sec, then").pack(side=tk.LEFT, padx=2)
+        
+        # Second gesture dropdown
+        second_gesture_cb = ttk.Combobox(row_frame, values=list(gesture_display.values()), width=15)
+        if second_gesture:
+            second_gesture_display = gesture_display.get(second_gesture, "")
+            if second_gesture_display in list(gesture_display.values()):
+                second_gesture_cb.set(second_gesture_display)
+            else:
+                second_gesture_cb.current(0)
+        else:
+            second_gesture_cb.current(0)
+        second_gesture_cb.pack(side=tk.LEFT, padx=5)
+        
+        # Action dropdown
+        ttk.Label(row_frame, text="=").pack(side=tk.LEFT, padx=5)
+        action_cb = ttk.Combobox(row_frame, values=[action_display[a] for a in self.config.available_actions], width=15)
+        if action:
+            action_display_value = action_display.get(action, "")
+            if action_display_value in [action_display[a] for a in self.config.available_actions]:
+                action_cb.set(action_display_value)
+            else:
+                action_cb.current(0)
+        else:
+            action_cb.current(0)
+        action_cb.pack(side=tk.LEFT, padx=5)
+        
+        # Delete button
+        delete_btn = ttk.Button(row_frame, text="X", width=2, 
+                              command=lambda: row_frame.destroy())
+        delete_btn.pack(side=tk.RIGHT, padx=5)
+        
+        # Save row reference
+        self.combo_rows.append({
+            "frame": row_frame,
+            "first_gesture": first_gesture_cb,
+            "duration": duration_sb,
+            "second_gesture": second_gesture_cb,
+            "action": action_cb
+        })
+
+# --- Facial Detection Functions ---
+def calculate_eye_aspect_ratio(eye_points):
+    """Calculate the eye aspect ratio to detect blinks"""
+    # Compute the euclidean distances between the vertical eye landmarks
+    A = np.linalg.norm(eye_points[1] - eye_points[5])
+    B = np.linalg.norm(eye_points[2] - eye_points[4])
+    
+    # Compute the euclidean distance between the horizontal eye landmarks
+    C = np.linalg.norm(eye_points[0] - eye_points[3])
+    
+    # Calculate the eye aspect ratio
+    ear = (A + B) / (2.0 * C)
+    return ear
+
+def calculate_mouth_aspect_ratio(mouth_points):
+    """Calculate the mouth aspect ratio to detect mouth opening"""
+    # Vertical distance
+    A = np.linalg.norm(mouth_points[2] - mouth_points[6])  # Top to bottom lip
+    
+    # Horizontal distance
+    B = np.linalg.norm(mouth_points[0] - mouth_points[4])  # Corner to corner
+    
+    # Calculate mouth aspect ratio
+    mar = A / B
+    return mar
+
+def detect_smile(mouth_points):
+    """Simple smile detection based on mouth corner lift"""
+    # Check if the corners of the mouth are lifted (smile)
+    mouth_center_y = (mouth_points[2][1] + mouth_points[6][1]) / 2
+    left_corner_lift = mouth_center_y - mouth_points[0][1]
+    right_corner_lift = mouth_center_y - mouth_points[4][1]
+    
+    # If both corners are lifted above threshold, consider it a smile
+    avg_lift = (left_corner_lift + right_corner_lift) / 2
+    return avg_lift > config.thresholds["SMILE_THRESHOLD"]
+
+def detect_eyebrow_position(face_landmarks, landmarks_array):
+    """Detect if eyebrows are raised, furrowed, or normal"""
+    # Get positions of eyebrows and eyes for reference
+    left_eyebrow = np.array([
+        [face_landmarks.part(17).x, face_landmarks.part(17).y],
+        [face_landmarks.part(18).x, face_landmarks.part(18).y],
+        [face_landmarks.part(19).x, face_landmarks.part(19).y],
+        [face_landmarks.part(20).x, face_landmarks.part(20).y],
+        [face_landmarks.part(21).x, face_landmarks.part(21).y]
+    ])
+    
+    right_eyebrow = np.array([
+        [face_landmarks.part(22).x, face_landmarks.part(22).y],
+        [face_landmarks.part(23).x, face_landmarks.part(23).y],
+        [face_landmarks.part(24).x, face_landmarks.part(24).y],
+        [face_landmarks.part(25).x, face_landmarks.part(25).y],
+        [face_landmarks.part(26).x, face_landmarks.part(26).y]
+    ])
+    
+    left_eye = np.array([
+        [face_landmarks.part(36).x, face_landmarks.part(36).y],
+        [face_landmarks.part(39).x, face_landmarks.part(39).y]
+    ])
+    
+    right_eye = np.array([
+        [face_landmarks.part(42).x, face_landmarks.part(42).y],
+        [face_landmarks.part(45).x, face_landmarks.part(45).y]
+    ])
+    
+    # Calculate distance between eyebrows and eyes
+    left_distance = np.mean(left_eyebrow[:, 1]) - np.mean(left_eye[:, 1])
+    right_distance = np.mean(right_eyebrow[:, 1]) - np.mean(right_eye[:, 1])
+    
+    # Calculate horizontal distance between inner eyebrow points
+    inner_distance = np.linalg.norm(left_eyebrow[4] - right_eyebrow[0])
+    
+    # Average eyebrow height above eyes
+    avg_height = (left_distance + right_distance) / 2
+    
+    # Determine eyebrow state (could calibrate these thresholds better)
+    if avg_height > 15:  # Higher threshold for raised
+        return "raised"
+    elif inner_distance < 40:  # Lower threshold for furrowed
+        return "furrowed"
+    else:
+        return "normal"
+
+def process_facial_features(face_landmarks, frame, width, height):
+    """Process facial features to detect various expressions and states"""
+    global blink_counter, mouth_open_counter, current_facial_state, eyes_closed, blink_start_time
+    global gesture_state, gesture_start_times, gesture_durations
+    
+    current_time = time.time()
+    
+    # Convert landmarks to numpy array for easier processing
+    landmarks_array = np.array([[p.x, p.y] for p in [face_landmarks.part(i) for i in range(68)]])
+    
+    # Process eyes
+    left_eye_points = landmarks_array[36:42]
+    right_eye_points = landmarks_array[42:48]
+    
+    left_ear = calculate_eye_aspect_ratio(left_eye_points)
+    right_ear = calculate_eye_aspect_ratio(right_eye_points)
+    
+    # Check for blinks, winks, and long blinks
+    if left_ear < config.thresholds["EYE_AR_THRESH"] and right_ear < config.thresholds["EYE_AR_THRESH"]:
+        blink_counter += 1
+        if blink_counter >= EYE_AR_CONSEC_FRAMES:
+            current_facial_state["eyes"] = "closed"
+            
+            # Track long blink for next song functionality
+            if not eyes_closed:
+                eyes_closed = True
+                blink_start_time = current_time
+            
+    elif left_ear < config.thresholds["EYE_AR_THRESH"] and right_ear >= config.thresholds["EYE_AR_THRESH"]:
+        current_facial_state["eyes"] = "left_wink"
+        eyes_closed = False  # Reset long blink tracking for winks
+    elif right_ear < config.thresholds["EYE_AR_THRESH"] and left_ear >= config.thresholds["EYE_AR_THRESH"]:
+        current_facial_state["eyes"] = "right_wink"
+        eyes_closed = False  # Reset long blink tracking for winks
+    else:
+        blink_counter = 0
+        current_facial_state["eyes"] = "open"
+        eyes_closed = False  # Reset long blink tracking
+    
+    # Process mouth
+    mouth_points = landmarks_array[48:68]  # All mouth landmark points
+    mouth_outline = np.array([mouth_points[0], mouth_points[2], mouth_points[4], mouth_points[6], 
+                              mouth_points[8], mouth_points[10], mouth_points[12]])
+    
+    mouth_ar = calculate_mouth_aspect_ratio(mouth_outline)
+    
+    if mouth_ar > config.thresholds["MOUTH_AR_THRESH"]:
+        mouth_open_counter += 1
+        if mouth_open_counter >= MOUTH_CONSEC_FRAMES:
+            if detect_smile(mouth_outline):
+                current_facial_state["mouth"] = "smile"
+            else:
+                current_facial_state["mouth"] = "open"
+    else:
+        mouth_open_counter = 0
+        current_facial_state["mouth"] = "closed"
+    
+    # Process eyebrows
+    current_facial_state["eyebrows"] = detect_eyebrow_position(face_landmarks, landmarks_array)
+    
+    # Update gesture states with durations
+    # Right wink detection
+    if current_facial_state["eyes"] == "right_wink":
+        if not gesture_state["right_wink"]:
+            gesture_state["right_wink"] = True
+            gesture_start_times["right_wink"] = current_time
+        gesture_durations["right_wink"] = current_time - gesture_start_times["right_wink"]
+    else:
+        gesture_state["right_wink"] = False
+        gesture_durations["right_wink"] = 0
+        
+    # Left wink detection
+    if current_facial_state["eyes"] == "left_wink":
+        if not gesture_state["left_wink"]:
+            gesture_state["left_wink"] = True
+            gesture_start_times["left_wink"] = current_time
+        gesture_durations["left_wink"] = current_time - gesture_start_times["left_wink"]
+    else:
+        gesture_state["left_wink"] = False
+        gesture_durations["left_wink"] = 0
+        
+    # Smile detection
+    if current_facial_state["mouth"] == "smile":
+        if not gesture_state["smile"]:
+            gesture_state["smile"] = True
+            gesture_start_times["smile"] = current_time
+        gesture_durations["smile"] = current_time - gesture_start_times["smile"]
+    else:
+        gesture_state["smile"] = False
+        gesture_durations["smile"] = 0
+        
+    # Open mouth detection
+    if current_facial_state["mouth"] == "open":
+        if not gesture_state["open_mouth"]:
+            gesture_state["open_mouth"] = True
+            gesture_start_times["open_mouth"] = current_time
+        gesture_durations["open_mouth"] = current_time - gesture_start_times["open_mouth"]
+    else:
+        gesture_state["open_mouth"] = False
+        gesture_durations["open_mouth"] = 0
+        
+    # Raised eyebrows detection
+    if current_facial_state["eyebrows"] == "raised":
+        if not gesture_state["raise_eyebrows"]:
+            gesture_state["raise_eyebrows"] = True
+            gesture_start_times["raise_eyebrows"] = current_time
+        gesture_durations["raise_eyebrows"] = current_time - gesture_start_times["raise_eyebrows"]
+    else:
+        gesture_state["raise_eyebrows"] = False
+        gesture_durations["raise_eyebrows"] = 0
+        
+    # Long blink tracking (already exists in your code)
+    if eyes_closed:
+        gesture_state["long_blink"] = True
+        gesture_durations["long_blink"] = current_time - blink_start_time
+    else:
+        gesture_state["long_blink"] = False
+        gesture_durations["long_blink"] = 0
+    
+    # Visualize facial features
+    # Draw eye contours
+    cv2.polylines(frame, [left_eye_points.astype(int)], True, (0, 255, 0), 1)
+    cv2.polylines(frame, [right_eye_points.astype(int)], True, (0, 255, 0), 1)
+    
+    # Draw mouth contour
+    cv2.polylines(frame, [mouth_outline.astype(int)], True, (0, 0, 255), 1)
+    
+    # Display facial state info
+    cv2.putText(frame, f"Eyes: {current_facial_state['eyes']}", (10, 90), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    cv2.putText(frame, f"Mouth: {current_facial_state['mouth']}", (10, 110), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    cv2.putText(frame, f"Eyebrows: {current_facial_state['eyebrows']}", (10, 130), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    
+    # Display duration information in the frame
+    for i, (gesture, duration) in enumerate(gesture_durations.items()):
+        if duration > 0:
+            cv2.putText(frame, f"{gesture}: {duration:.1f}s", 
+                       (width - 200, 150 + i*20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+    
+    return frame
+
+def get_head_pose(shape, frame_width, frame_height):
+    # 3D model points (generic face model)
+    model_points = np.array([
+        (0.0, 0.0, 0.0),             # Nose tip 34
+        (0.0, -330.0, -65.0),        # Chin 9
+        (-225.0, 170.0, -135.0),     # Left eye left corner 37
+        (225.0, 170.0, -135.0),      # Right eye right corne 46
+        (-150.0, -150.0, -125.0),    # Left Mouth corner 49
+        (150.0, -150.0, -125.0)      # Right mouth corner 55
+    ]) / 4.5 # Scale down model
+
+    # 2D image points from dlib shape detector
+    image_points = np.array([
+        (shape.part(33).x, shape.part(33).y),     # Nose tip
+        (shape.part(8).x, shape.part(8).y),       # Chin
+        (shape.part(36).x, shape.part(36).y),     # Left eye left corner
+        (shape.part(45).x, shape.part(45).y),     # Right eye right corner
+        (shape.part(48).x, shape.part(48).y),     # Left Mouth corner
+        (shape.part(54).x, shape.part(54).y)      # Right mouth corner
+    ], dtype="double")
+
+    # Camera internals (assuming standard webcam)
+    focal_length = frame_width
+    center = (frame_width / 2, frame_height / 2)
+    camera_matrix = np.array([
+        [focal_length, 0, center[0]],
+        [0, focal_length, center[1]],
+        [0, 0, 1]
+    ], dtype="double")
+
+    dist_coeffs = np.zeros((4, 1)) # Assuming no lens distortion
+
+    # Solve PnP: Find rotation and translation vectors
+    try:
+        (success, rotation_vector, translation_vector) = cv2.solvePnP(
+            model_points, image_points, camera_matrix, dist_coeffs#, flags=cv2.SOLVEPNP_ITERATIVE
+        )
+        if not success: return None # Return None if solvePnP fails
+    except Exception as e:
+        # print(f"Error in solvePnP: {e}") # Uncomment for debugging
+        return None # Return None if solvePnP raises an exception
+
+
+    # Project 3D point (0, 0, 1000.0) onto the image plane for drawing line
+    try:
+        (nose_end_point2D, jacobian) = cv2.projectPoints(
+            np.array([(0.0, 0.0, 500.0)]), # Point in front of nose
+            rotation_vector, translation_vector, camera_matrix, dist_coeffs
+        )
+    except Exception as e:
+        # print(f"Error in projectPoints: {e}") # Uncomment for debugging
+        return None # Return None if projectPoints fails
+
+
+    # --- Convert rotation vector to Euler angles ---
+    rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+    proj_matrix = np.hstack((rotation_matrix, translation_vector))
+
+    try:
+        eulerAngles = cv2.decomposeProjectionMatrix(proj_matrix)[6]
+    except Exception as e:
+        # print(f"Error in decomposeProjectionMatrix: {e}") # Uncomment for debugging
+        return None # Return None if decomposeProjectionMatrix fails
+
+
+    # Convert rotation angles from the matrix to radians
+    pitch = math.radians(eulerAngles[0, 0])
+    yaw = math.radians(eulerAngles[1, 0])
+    roll = math.radians(eulerAngles[2, 0])
+
+    # Adjusting angle signs based on common conventions
+    pitch = math.degrees(math.asin(math.sin(pitch)))
+    roll = -math.degrees(math.asin(math.sin(roll)))
+    yaw = math.degrees(math.asin(math.sin(yaw)))
+
+    return pitch, yaw, roll, image_points[0], nose_end_point2D # Return angles and points for drawing
+
+def check_gesture_combination(first_gesture, duration_requirement, second_gesture):
+    """Check if a specific gesture combination has been performed"""
+    global gesture_state, gesture_durations, active_combinations
+    
+    # Check if first gesture has been active for required duration
+    if (gesture_state.get(first_gesture, False) and 
+        gesture_durations.get(first_gesture, 0) >= duration_requirement):
+        
+        # If second gesture is active now, the combination is complete
+        if gesture_state.get(second_gesture, False):
+            return True
+    
+    return False
+
+# --- Main Loop ---
+def run_music_control():
+    global last_action_time, last_continuous_action_time, continuous_action_active
+    global blink_counter, mouth_open_counter, current_facial_state, eyes_closed, blink_start_time
+    global gesture_state, gesture_start_times, gesture_durations, active_combinations
+    
+    # Load configuration from saved file
+    config.load_config()
+    
+    # Initialize variables based on config
+    last_action_time = 0
+    last_continuous_action_time = 0
+    continuous_action_active = False
+    blink_counter = 0
+    blink_start_time = 0
+    mouth_open_counter = 0
+    eyes_closed = False
+    current_facial_state = {
+        "eyes": "open",    # "open", "closed", "right_wink", "left_wink"
+        "mouth": "closed", # "closed", "open", "smile"
+        "eyebrows": "normal" # "normal", "raised", "furrowed"
+    }
+    
+    # Initialize gesture tracking variables
+    gesture_state = {}
+    gesture_start_times = {}
+    gesture_durations = {}
+    active_combinations = []
+    completed_combinations = set()  # Track combinations that have been triggered
+    
+    # Initialize all gesture states
+    for gesture in ["look_right", "look_left", "long_blink", "look_up", "look_down", 
+                   "smile", "open_mouth", "raise_eyebrows", "right_wink", "left_wink"]:
+        gesture_state[gesture] = False
+        gesture_start_times[gesture] = 0
+        gesture_durations[gesture] = 0
+    
+    # Constants for detection
+    global EYE_AR_CONSEC_FRAMES, MOUTH_CONSEC_FRAMES
+    EYE_AR_CONSEC_FRAMES = 3   # Consecutive frames with eye AR below threshold for blink
+    MOUTH_CONSEC_FRAMES = 3    # Consecutive frames with mouth AR above threshold
+    
+    # Initialize detector and predictor
+    detector = dlib.get_frontal_face_detector()
+    
+    # Find predictor path - check current directory and then common locations
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    predictor_path = os.path.join(script_dir, "shape_predictor_68_face_landmarks.dat")
+    
+    # Check for model file in common locations if not in current directory
+    if not os.path.exists(predictor_path):
+        common_paths = [
+            "shape_predictor_68_face_landmarks.dat",
+            os.path.join(os.path.expanduser("~"), "shape_predictor_68_face_landmarks.dat"),
+            os.path.join(os.path.expanduser("~"), "Downloads", "shape_predictor_68_face_landmarks.dat"),
+        ]
+        
+        for path in common_paths:
+            if os.path.exists(path):
+                predictor_path = path
+                break
+    
+    # Check if model exists
+    if not os.path.exists(predictor_path):
+        print(f"Error: Shape predictor model not found.")
+        print("Download 'shape_predictor_68_face_landmarks.dat' from http://dlib.net/files/")
+        print("and place it in the same directory as the script.")
+        return
+    
+    try:
+        predictor = dlib.shape_predictor(predictor_path)
+    except RuntimeError as e:
+        print(f"Error loading shape predictor model.")
+        print(f"Details: {e}")
+        return
+    
+    cap = cv2.VideoCapture(0) # Use 0 for default webcam
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        return
+
+    print("\n--- Customizable Music Accessibility Control ---")
+    print("Gesture Mappings:")
+    for gesture, action in config.gesture_actions.items():
+        if action and action != "none":
+            print(f"  {gesture.replace('_', ' ').title()}: {action.replace('_', ' ').title()}")
+    
+    print("\nAdvanced Gesture Combinations:")
+    for i, combo in enumerate(config.gesture_combinations):
+        print(f"  {i+1}. {combo['first_gesture'].replace('_', ' ').title()} for {combo['duration']}s, " + 
+              f"then {combo['second_gesture'].replace('_', ' ').title()} = " +
+              f"{combo['action'].replace('_', ' ').title()}")
+    
+    print("\nSensitivity Settings:")
+    for key, value in config.thresholds.items():
+        print(f"  {key.replace('_', ' ').title()}: {value}")
+    
+    print("\nKeyboard Controls:")
+    print("  'p': Print current settings")
+    print("  'q': Quit")
+    print("-----------------------------------------------------------------------\n")
+
+    # Track long blink duration
+    long_blink_active = False
+    long_blink_progress = 0
+    
+    # For tracking combination gestures
+    combination_status = {}
+    for combo in config.gesture_combinations:
+        combo_id = f"{combo['first_gesture']}_{combo['duration']}_{combo['second_gesture']}"
+        combination_status[combo_id] = {
+            "first_complete": False,
+            "completed": False,
+            "action": combo['action']
+        }
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            # print("Error: Failed to grab frame.") # Can be noisy if intermittent
+            time.sleep(0.1) # Wait a bit if frame grab fails
+            continue
+
+        try:
+            frame = cv2.flip(frame, 1) # Mirror frame horizontally
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            height, width = frame.shape[:2]
+        except Exception as e:
+            print(f"Error processing frame: {e}")
+            continue
+
+        faces = detector(gray)
+        gesture_detected_this_frame = False # Flag to prevent multiple actions per frame
+
+        for face in faces:
+            try:
+                landmarks = predictor(gray, face)
+            except Exception as e:
+                 print(f"Error predicting landmarks: {e}")
+                 continue # Skip this face if landmark prediction fails
+
+            # --- Enhanced Facial Feature Processing ---
+            frame = process_facial_features(landmarks, frame, width, height)
+
+            # --- Estimate Head Pose ---
+            pose_results = get_head_pose(landmarks, width, height)
+
+            if pose_results is None:
+                # print("Could not estimate pose for this frame.") # Uncomment for debugging
+                continue # Skip if pose estimation failed
+
+            pitch, yaw, roll, nose_2d, nose_tip_line_end = pose_results
+
+            # --- Draw Pose Indicator Line (Optional Visualization) ---
+            p1 = (int(nose_2d[0]), int(nose_2d[1]))
+            p2 = (int(nose_tip_line_end[0][0][0]), int(nose_tip_line_end[0][0][1]))
+            cv2.line(frame, p1, p2, (255, 0, 0), 2)
+            cv2.putText(frame, f"Pitch: {pitch:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+            cv2.putText(frame, f"Yaw:   {yaw:.1f}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+            # cv2.putText(frame, f"Roll:  {roll:.1f}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1) # Roll not used for control
+
+            # --- Update Head Position Gestures ---
+            current_time = time.time()
+            
+            # Look right
+            if yaw < config.thresholds["YAW_THRESHOLD_RIGHT"]:
+                gesture_state["look_right"] = True
+                if not gesture_start_times["look_right"]:
+                    gesture_start_times["look_right"] = current_time
+                gesture_durations["look_right"] = current_time - gesture_start_times["look_right"]
+            else:
+                gesture_state["look_right"] = False
+                gesture_start_times["look_right"] = 0
+                gesture_durations["look_right"] = 0
+                
+            # Look left
+            if yaw > config.thresholds["YAW_THRESHOLD_LEFT"]:
+                gesture_state["look_left"] = True
+                if not gesture_start_times["look_left"]:
+                    gesture_start_times["look_left"] = current_time
+                gesture_durations["look_left"] = current_time - gesture_start_times["look_left"]
+            else:
+                gesture_state["look_left"] = False
+                gesture_start_times["look_left"] = 0
+                gesture_durations["look_left"] = 0
+                
+            # Look up
+            if pitch < config.thresholds["PITCH_THRESHOLD_UP"]:
+                gesture_state["look_up"] = True
+                if not gesture_start_times["look_up"]:
+                    gesture_start_times["look_up"] = current_time
+                gesture_durations["look_up"] = current_time - gesture_start_times["look_up"]
+            else:
+                gesture_state["look_up"] = False
+                gesture_start_times["look_up"] = 0
+                gesture_durations["look_up"] = 0
+                
+            # Look down
+            if pitch > config.thresholds["PITCH_THRESHOLD_DOWN"]:
+                gesture_state["look_down"] = True
+                if not gesture_start_times["look_down"]:
+                    gesture_start_times["look_down"] = current_time
+                gesture_durations["look_down"] = current_time - gesture_start_times["look_down"]
+            else:
+                gesture_state["look_down"] = False
+                gesture_start_times["look_down"] = 0
+                gesture_durations["look_down"] = 0
+            
+            # --- Check for Advanced Gesture Combinations ---
+            for combo in config.gesture_combinations:
+                first_gesture = combo["first_gesture"]
+                required_duration = combo["duration"]
+                second_gesture = combo["second_gesture"]
+                action = combo["action"]
+                
+                combo_id = f"{first_gesture}_{required_duration}_{second_gesture}"
+                
+                # Check if first gesture has been held long enough
+                if gesture_state.get(first_gesture, False) and gesture_durations.get(first_gesture, 0) >= required_duration:
+                    if not combination_status[combo_id]["first_complete"]:
+                        combination_status[combo_id]["first_complete"] = True
+                        print(f"First part of combination completed: {first_gesture} for {required_duration}s")
+                
+                # If first part completed and second gesture detected, trigger action
+                if combination_status[combo_id]["first_complete"] and gesture_state.get(second_gesture, False):
+                    if not combination_status[combo_id]["completed"] and current_time - last_action_time > config.thresholds["ACTION_COOLDOWN"]:
+                        print(f"Combination completed: {first_gesture} + {second_gesture} = {action}")
+                        combination_status[combo_id]["completed"] = True
+                        
+                        # Execute the action
+                        if action in action_functions:
+                            action_functions[action]()
+                            last_action_time = current_time
+                            
+                            # Display on screen
+                            cv2.putText(frame, f"COMBO: {action.replace('_', ' ').title()}", 
+                                      (width - 300, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                
+                # Reset combination if first gesture released before completion
+                if not gesture_state.get(first_gesture, False) and combination_status[combo_id]["first_complete"] and not combination_status[combo_id]["completed"]:
+                    combination_status[combo_id]["first_complete"] = False
+                    print(f"Combination reset: {first_gesture} released")
+                
+                # Reset completed status after cooldown
+                if combination_status[combo_id]["completed"] and current_time - last_action_time > config.thresholds["ACTION_COOLDOWN"] * 2:
+                    combination_status[combo_id]["completed"] = False
+                    combination_status[combo_id]["first_complete"] = False
+            
+            # --- Map gestures to actions based on user config ---
+            
+            # Check look right action (yaw < threshold) - continuous action
+            if gesture_state["look_right"]:
+                look_right_action = config.gesture_actions.get("look_right")
+                if look_right_action and look_right_action != "none":
+                    if current_time - last_continuous_action_time > config.thresholds["CONTINUOUS_ACTION_INTERVAL"]:
+                        # Execute the configured action
+                        action_func = action_functions.get(look_right_action)
+                        if action_func:
+                            action_func()
+                            last_continuous_action_time = current_time
+                            continuous_action_active = True
+                            # Visual feedback
+                            cv2.putText(frame, f"ACTIVE: {look_right_action.replace('_', ' ').title()}", 
+                                       (width - 250, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            else:
+                continuous_action_active = False
+            
+            # Check look left action (yaw > threshold)
+            if gesture_state["look_left"] and not continuous_action_active:
+                look_left_action = config.gesture_actions.get("look_left")
+                if look_left_action and look_left_action != "none":
+                    if current_time - last_action_time > config.thresholds["ACTION_COOLDOWN"]:
+                        action_func = action_functions.get(look_left_action)
+                        if action_func:
+                            action_func()
+                            last_action_time = current_time
+                            gesture_detected_this_frame = True
+            
+            # Check look up action (pitch < threshold)
+            if gesture_state["look_up"] and not continuous_action_active:
+                look_up_action = config.gesture_actions.get("look_up")
+                if look_up_action and look_up_action != "none":
+                    if current_time - last_action_time > config.thresholds["ACTION_COOLDOWN"]:
+                        action_func = action_functions.get(look_up_action)
+                        if action_func:
+                            action_func()
+                            last_action_time = current_time
+                            gesture_detected_this_frame = True
+            
+            # Check look down action (pitch > threshold)
+            if gesture_state["look_down"] and not continuous_action_active:
+                look_down_action = config.gesture_actions.get("look_down")
+                if look_down_action and look_down_action != "none":
+                    if current_time - last_action_time > config.thresholds["ACTION_COOLDOWN"]:
+                        action_func = action_functions.get(look_down_action)
+                        if action_func:
+                            action_func()
+                            last_action_time = current_time
+                            gesture_detected_this_frame = True
+            
+            # Check for long blink (mapped to configured action)
+            if gesture_state["long_blink"] and gesture_durations["long_blink"] >= config.thresholds["LONG_BLINK_DURATION"]:
+                long_blink_action = config.gesture_actions.get("long_blink")
+                if long_blink_action and long_blink_action != "none":
+                    if current_time - last_action_time > config.thresholds["ACTION_COOLDOWN"]:
+                        action_func = action_functions.get(long_blink_action)
+                        if action_func:
+                            action_func()
+                            last_action_time = current_time
+                            gesture_detected_this_frame = True
+                            blink_start_time = 0  # Reset blink timer
+                            eyes_closed = False   # Reset eyes closed state
+                            long_blink_active = False
+            
+            # Check for right wink
+            if gesture_state["right_wink"] and gesture_durations["right_wink"] >= config.thresholds["RIGHT_WINK_DURATION"]:
+                right_wink_action = config.gesture_actions.get("right_wink")
+                if right_wink_action and right_wink_action != "none":
+                    if current_time - last_action_time > config.thresholds["ACTION_COOLDOWN"]:
+                        action_func = action_functions.get(right_wink_action)
+                        if action_func:
+                            action_func()
+                            last_action_time = current_time
+                            gesture_detected_this_frame = True
+            
+            # Check for left wink
+            if gesture_state["left_wink"] and gesture_durations["left_wink"] >= config.thresholds["LEFT_WINK_DURATION"]:
+                left_wink_action = config.gesture_actions.get("left_wink")
+                if left_wink_action and left_wink_action != "none":
+                    if current_time - last_action_time > config.thresholds["ACTION_COOLDOWN"]:
+                        action_func = action_functions.get(left_wink_action)
+                        if action_func:
+                            action_func()
+                            last_action_time = current_time
+                            gesture_detected_this_frame = True
+            
+            # Check for smile
+            if gesture_state["smile"] and gesture_durations["smile"] >= config.thresholds["SMILE_DURATION"]:
+                smile_action = config.gesture_actions.get("smile")
+                if smile_action and smile_action != "none":
+                    if current_time - last_action_time > config.thresholds["ACTION_COOLDOWN"]:
+                        action_func = action_functions.get(smile_action)
+                        if action_func:
+                            action_func()
+                            last_action_time = current_time
+                            gesture_detected_this_frame = True
+            
+            # Check for open mouth
+            if gesture_state["open_mouth"] and gesture_durations["open_mouth"] >= config.thresholds["OPEN_MOUTH_DURATION"]:
+                open_mouth_action = config.gesture_actions.get("open_mouth")
+                if open_mouth_action and open_mouth_action != "none":
+                    if current_time - last_action_time > config.thresholds["ACTION_COOLDOWN"]:
+                        action_func = action_functions.get(open_mouth_action)
+                        if action_func:
+                            action_func()
+                            last_action_time = current_time
+                            gesture_detected_this_frame = True
+            
+            # Check for raised eyebrows
+            if gesture_state["raise_eyebrows"] and gesture_durations["raise_eyebrows"] >= config.thresholds.get("RAISED_EYEBROWS_DURATION", 2.0):
+                raised_eyebrows_action = config.gesture_actions.get("raise_eyebrows")
+                if raised_eyebrows_action and raised_eyebrows_action != "none":
+                    if current_time - last_action_time > config.thresholds["ACTION_COOLDOWN"]:
+                        action_func = action_functions.get(raised_eyebrows_action)
+                        if action_func:
+                            action_func()
+                            last_action_time = current_time
+                            gesture_detected_this_frame = True
+
+            # Only process the first detected face per frame reliably
+            break  # Exit face loop after processing the first face
+
+        # --- Display Frame with Current Gesture State ---
+        # Status display
+        cv2.rectangle(frame, (0, height - 40), (width, height), (0, 0, 0), -1)  # Black background
+        
+        active_gestures = []
+        if continuous_action_active:
+            look_right_action = config.gesture_actions.get("look_right")
+            if look_right_action and look_right_action != "none":
+                active_gestures.append(f"{look_right_action.replace('_', ' ').title()} (continuous)")
+        
+        # Display long blink progress if active
+        if gesture_state["long_blink"] and gesture_durations["long_blink"] > 0:
+            duration = gesture_durations["long_blink"]
+            if duration < config.thresholds["LONG_BLINK_DURATION"]:
+                # Draw progress bar for long blink
+                progress_width = int(width * (duration / config.thresholds["LONG_BLINK_DURATION"]))
+                cv2.rectangle(frame, (0, height - 5), (progress_width, height), (0, 255, 0), -1)
+                
+                long_blink_action = config.gesture_actions.get("long_blink")
+                if long_blink_action and long_blink_action != "none":
+                    active_gestures.append(f"{long_blink_action.replace('_', ' ').title()} " +
+                                          f"({duration:.1f}s / {config.thresholds['LONG_BLINK_DURATION']:.1f}s)")
+        
+        # Display combination progress
+        for combo in config.gesture_combinations:
+            first_gesture = combo["first_gesture"]
+            required_duration = combo["duration"]
+            second_gesture = combo["second_gesture"]
+            
+            if gesture_state.get(first_gesture, False) and gesture_durations.get(first_gesture, 0) > 0:
+                duration = gesture_durations[first_gesture]
+                if duration < required_duration:
+                    # Show progress towards first part of combination
+                    combo_text = f"Combo: {first_gesture.replace('_', ' ').title()} " + \
+                               f"({duration:.1f}s / {required_duration:.1f}s)"
+                    active_gestures.append(combo_text)
+                elif gesture_state.get(second_gesture, False):
+                    # Show that combination is ready to complete
+                    combo_text = f"Combo Ready: {second_gesture.replace('_', ' ').title()} to complete"
+                    active_gestures.append(combo_text)
+        
+        status_text = "Active: " + ", ".join(active_gestures) if active_gestures else "Ready"
+        cv2.putText(frame, status_text, (10, height - 15), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        cv2.imshow("Customizable Music Control - Facial Gestures", frame)
+
+        # --- Handle Keyboard Input ---
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q'):
+            print("Quitting...")
+            break
+        elif key == ord('p'):
+             print("\n--- Current Settings ---")
+             print("Gesture Mappings:")
+             for gesture, action in config.gesture_actions.items():
+                 if action and action != "none":
+                     print(f"  {gesture.replace('_', ' ').title()}: {action.replace('_', ' ').title()}")
+             
+             print("\nAdvanced Gesture Combinations:")
+             for i, combo in enumerate(config.gesture_combinations):
+                 print(f"  {i+1}. {combo['first_gesture'].replace('_', ' ').title()} for {combo['duration']}s, " + 
+                      f"then {combo['second_gesture'].replace('_', ' ').title()} = " +
+                      f"{combo['action'].replace('_', ' ').title()}")
+             
+             print("\nThresholds:")
+             for key, value in config.thresholds.items():
+                 print(f"  {key.replace('_', ' ').title()}: {value}")
+             print("--------------------------\n")
+
+    # --- Cleanup ---
+    cap.release()
+    cv2.destroyAllWindows()
+
+# --- Package Creation Function ---
+def create_package():
+    """Create instructions for packaging the application"""
+    print("\n--- Packaging Instructions ---")
+    print("To create a standalone executable with all dependencies:")
+    print("\n1. Install PyInstaller:")
+    print("   pip install pyinstaller")
+    
+    print("\n2. Ensure you have downloaded the shape predictor file:")
+    print("   shape_predictor_68_face_landmarks.dat")
+    print("   (Download from: http://dlib.net/files/)")
+    
+    print("\n3. Run PyInstaller with this command:")
+    print("   pyinstaller --onefile --add-data \"shape_predictor_68_face_landmarks.dat;.\" music_control.py")
+    
+    print("\n4. Find your executable in the 'dist' folder")
+    print("   This executable will include all dependencies and can be distributed to users.")
+    
+    print("\nNote: For macOS users, you'll need to grant permission for the executable to access the camera.")
+    print("      You may also need to run: chmod +x dist/music_control")
+    
+    print("\nFor Windows users:")
+    print("   pyinstaller --onefile --add-data \"shape_predictor_68_face_landmarks.dat;.\" music_control.py")
+    print("   The executable will be in the dist folder.")
+    
+    print("\nFor Linux users, you may need to install additional dependencies:")
+    print("   sudo apt-get install libsm6 libxext6 libxrender-dev")
+    print("   Then run: pyinstaller --onefile --add-data \"shape_predictor_68_face_landmarks.dat:.\" music_control.py")
+    
+    print("\n--- End Packaging Instructions ---\n")
+
+# --- Main Function ---
+def main():
+    # Try to load configuration
+    config.load_config()
+    
+    # Start with configuration UI
+    root = tk.Tk()
+    config_ui = ConfigurationUI(root, config)
+    root.mainloop()
+    
+    # Check if we should start the application
+    if hasattr(config_ui, 'start_app') and config_ui.start_app:
+        run_music_control()
+    else:
+        print("Configuration completed without starting the application.")
+        create_package()
+
+if __name__ == "__main__":
+    main()
