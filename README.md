@@ -9,7 +9,13 @@ https://youtu.be/aip8K8_nnNo
 # Where to Download
 Full Code in located as one.py 
 
-Actual GUI is located as zip-file
+
+Actual GUI is located as zip-file as one.zip
+
+# Images
+<img width="1434" alt="Screenshot 2025-05-03 at 9 33 44 PM" src="https://github.com/user-attachments/assets/ebef8248-83e1-4073-869c-0efe16397486" />
+<img width="727" alt="Screenshot 2025-05-03 at 9 35 52 PM" src="https://github.com/user-attachments/assets/e30125fd-6668-47a0-ad3e-9287f195a9c7" />
+
 # Core Functionality
 The application uses computer vision and facial landmark detection to track a user's face through their webcam and interpret specific movements as commands to control music playback. The primary features include:
 
@@ -87,4 +93,3 @@ Configuration Management: Provides saving and loading of user preferences in JSO
 
 # Target Users
 This application is particularly valuable for users with physical limitations who may find it difficult to use traditional computer interfaces. By providing hands-free control of music playback, it enhances accessibility and autonomy for people with various mobility challenges.
-The developer specifically mentions that while it currently only supports macOS and Spotify, there are plans to expand compatibility to include Apple Music and non-macOS platforms.
