@@ -1,7 +1,7 @@
 
 # Head Gesture Music Control Application
 
-This application is an accessibility tool that allows users with physica limitations to control music playback using head gestures and facial expressions, without needing to use their hands. It was created by me, Michael Li. I am a junior at the University of Notre Dame.
+This application is an accessibility tool that allows users with physical limitations to control music playback using head gestures and facial expressions, without needing to use their hands. It was created by me, Michael Li. I am a junior at the University of Notre Dame.
 
 # Youtube Link 
 https://youtu.be/aip8K8_nnNo
